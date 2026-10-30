@@ -5,6 +5,10 @@
 //  * Anything you type to the bot is kept in an inbox you can open in Notepad++.
 //
 // Only messages from the chat id in the settings are ever answered.
+//
+// Cloud mode (optional): when a Cloudflare Worker (cloud/worker.js) is connected, the
+// Worker answers the phone 24/7 and this plugin only syncs with it: it uploads notes
+// when they are saved and downloads phone notes and the todo/grocery lists.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -12,6 +16,7 @@
 #include <winhttp.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <bcrypt.h>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -31,6 +36,12 @@ static HINTERNET g_pollRequest = nullptr;
 static volatile LONG g_stopping = 0;
 static volatile LONG g_pausePoll = 0;
 static std::wstring g_iniPath, g_statePath;
+static HANDLE g_wakeEvent = nullptr;     // wakes the background thread (file saved, sync now)
+static CRITICAL_SECTION g_queueLock;     // guards g_uploadQueue
+static std::vector<std::wstring> g_uploadQueue;
+static CRITICAL_SECTION g_pullLock;      // one cloud inbox download at a time
+static volatile LONG g_fullSync = 1;     // cloud: upload every changed note on the next pass
+static volatile LONG g_reportSync = 0;   // cloud: say "synced" on the status bar after the next pass
 
 #define WM_TN_AUTOFETCH (WM_APP + 1)
 #define WM_TN_STATUS (WM_APP + 2)
@@ -357,6 +368,9 @@ struct Config {
 	std::wstring notesFolder;
 	bool autoOpen = false;
 	int longChars = 3800;
+	std::wstring cloudUrl;
+	std::string syncKey;
+	bool cloud = false;  // connected to the cloud bot at cloudUrl
 	bool ready() const { return !token.empty() && !chatId.empty(); }
 };
 
@@ -388,7 +402,14 @@ static const wchar_t INI_TEMPLATE[] =
 	L"AutoOpenPhoneNotes=0\r\n"
 	L"\r\n"
 	L"; Notes longer than this many characters are sent as a file instead of a message\r\n"
-	L"LongNoteChars=3800\r\n";
+	L"LongNoteChars=3800\r\n"
+	L"\r\n"
+	L"[Cloud]\r\n"
+	L"; Optional: lets the bot answer while your PC is off (see README: free Cloudflare setup).\r\n"
+	L"; Paste your Worker address here, e.g. https://telegram-notes.yourname.workers.dev\r\n"
+	L"CloudUrl=\r\n"
+	L"; Filled in for you by \"Connect to cloud\". Keep it secret.\r\n"
+	L"SyncKey=\r\n";
 
 static void EnsureIni() {
 	if (FileExists(g_iniPath)) return;
@@ -430,6 +451,12 @@ static Config LoadConfig() {
 	if (c.notesFolder.empty()) c.notesFolder = DefaultNotesFolder();
 	c.autoOpen = _wtoi(IniGet(g_iniPath, L"Options", L"AutoOpenPhoneNotes", L"0").c_str()) != 0;
 	c.longChars = std::min(4000, std::max(200, _wtoi(IniGet(g_iniPath, L"Options", L"LongNoteChars", L"3800").c_str())));
+	c.cloudUrl = IniGet(g_iniPath, L"Cloud", L"CloudUrl");
+	while (!c.cloudUrl.empty() && (c.cloudUrl.back() == L'/' || c.cloudUrl.back() == L' ')) c.cloudUrl.pop_back();
+	while (!c.cloudUrl.empty() && c.cloudUrl.front() == L' ') c.cloudUrl.erase(0, 1);
+	if (!c.cloudUrl.empty() && c.cloudUrl.find(L"://") == std::wstring::npos) c.cloudUrl = L"https://" + c.cloudUrl;
+	c.syncKey = Trim(W2U(IniGet(g_iniPath, L"Cloud", L"SyncKey")));
+	c.cloud = !c.cloudUrl.empty() && !c.syncKey.empty() && IniGet(g_statePath, L"Cloud", L"ConnectedUrl") == c.cloudUrl;
 	SHCreateDirectoryExW(nullptr, c.notesFolder.c_str(), nullptr);
 	return c;
 }
@@ -443,15 +470,16 @@ static void SaveOffset(long long v) {
 // ============================================================================
 // HTTPS + Telegram Bot API
 // ============================================================================
-static bool HttpPost(const std::wstring &path, const std::string &body, const std::wstring &contentType,
-                     std::string &response, DWORD &status, std::string &err, DWORD timeoutMs, bool cancellable) {
+static bool HttpRequest(const std::wstring &host, INTERNET_PORT port, bool secure, const wchar_t *verb, const std::wstring &path,
+                        const std::string &body, const std::wstring &contentType, const std::wstring &extraHeaders,
+                        std::string &response, DWORD &status, std::string &err, DWORD timeoutMs, bool cancellable) {
 	status = 0;
 	HINTERNET ses = WinHttpOpen(L"NppTelegramNotes/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!ses) ses = WinHttpOpen(L"NppTelegramNotes/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	if (!ses) { err = "Windows could not start an internet connection."; return false; }
 	WinHttpSetTimeouts(ses, 15000, 15000, 30000, (int)timeoutMs);
-	HINTERNET con = WinHttpConnect(ses, L"api.telegram.org", INTERNET_DEFAULT_HTTPS_PORT, 0);
-	HINTERNET req = con ? WinHttpOpenRequest(con, L"POST", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+	HINTERNET con = WinHttpConnect(ses, host.c_str(), port, 0);
+	HINTERNET req = con ? WinHttpOpenRequest(con, verb, path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, secure ? WINHTTP_FLAG_SECURE : 0) : nullptr;
 	bool ok = req != nullptr;
 	if (ok && cancellable) {
 		EnterCriticalSection(&g_lock);
@@ -461,7 +489,7 @@ static bool HttpPost(const std::wstring &path, const std::string &body, const st
 		if (!ok) { WinHttpCloseHandle(req); req = nullptr; err = "cancelled"; }
 	}
 	if (ok) {
-		std::wstring hdr = L"Content-Type: " + contentType + L"\r\n";
+		std::wstring hdr = L"Content-Type: " + contentType + L"\r\n" + extraHeaders;
 		ok = WinHttpSendRequest(req, hdr.c_str(), (DWORD)-1L, (LPVOID)body.data(), (DWORD)body.size(), (DWORD)body.size(), 0) &&
 		     WinHttpReceiveResponse(req, nullptr);
 		if (ok) {
@@ -480,7 +508,7 @@ static bool HttpPost(const std::wstring &path, const std::string &body, const st
 			DWORD e = GetLastError();
 			if (e == ERROR_WINHTTP_TIMEOUT) err = "Telegram did not answer in time (timeout).";
 			else if (e == ERROR_WINHTTP_NAME_NOT_RESOLVED || e == ERROR_WINHTTP_CANNOT_CONNECT)
-				err = "Could not reach api.telegram.org. Check your internet connection (or firewall/proxy).";
+				err = "Could not reach " + W2U(host) + ". Check your internet connection (or firewall/proxy).";
 			else if (e == ERROR_WINHTTP_OPERATION_CANCELLED || e == ERROR_INVALID_HANDLE) err = "cancelled";
 			else err = "Network error " + std::to_string(e) + ".";
 		}
@@ -496,6 +524,12 @@ static bool HttpPost(const std::wstring &path, const std::string &body, const st
 	if (con) WinHttpCloseHandle(con);
 	WinHttpCloseHandle(ses);
 	return ok;
+}
+
+static bool HttpPost(const std::wstring &path, const std::string &body, const std::wstring &contentType,
+                     std::string &response, DWORD &status, std::string &err, DWORD timeoutMs, bool cancellable) {
+	return HttpRequest(L"api.telegram.org", INTERNET_DEFAULT_HTTPS_PORT, true, L"POST", path, body, contentType, L"",
+	                   response, status, err, timeoutMs, cancellable);
 }
 
 static void CancelPoll() {
@@ -1046,12 +1080,240 @@ static void HandleMessage(const Config &c, const JVal &msg) {
 	}
 }
 
+// ============================================================================
+// Cloud sync (background thread, and "Fetch" on the UI thread)
+// ============================================================================
+static std::string UrlEncode(const std::string &s) {
+	static const char hex[] = "0123456789ABCDEF";
+	std::string o;
+	for (unsigned char ch : s) {
+		if (isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') o += (char)ch;
+		else { o += '%'; o += hex[ch >> 4]; o += hex[ch & 15]; }
+	}
+	return o;
+}
+
+static std::wstring Hash(const std::string &s) {
+	unsigned long long h = 1469598103934665603ULL;
+	for (unsigned char ch : s) { h ^= ch; h *= 1099511628211ULL; }
+	wchar_t buf[24];
+	wsprintfW(buf, L"%08x%08x", (unsigned)(h >> 32), (unsigned)h);
+	return buf;
+}
+
+static std::string RandomHex(int bytes) {
+	std::vector<unsigned char> b(bytes);
+	BCryptGenRandom(nullptr, b.data(), (ULONG)b.size(), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+	std::string o;
+	char buf[4];
+	for (unsigned char ch : b) { wsprintfA(buf, "%02x", ch); o += buf; }
+	return o;
+}
+
+static bool CloudCall(const Config &c, const wchar_t *verb, const std::string &pathQuery, const std::string &body, JVal &out,
+                      std::string &err, bool cancellable = false, const wchar_t *contentType = L"application/json; charset=utf-8") {
+	URL_COMPONENTS u = {};
+	u.dwStructSize = sizeof(u);
+	wchar_t host[256] = {}, path[1024] = {};
+	u.lpszHostName = host;
+	u.dwHostNameLength = 256;
+	u.lpszUrlPath = path;
+	u.dwUrlPathLength = 1024;
+	if (!WinHttpCrackUrl(c.cloudUrl.c_str(), 0, 0, &u)) {
+		err = "CloudUrl in the settings is not a valid web address.";
+		return false;
+	}
+	std::wstring base = path;
+	while (!base.empty() && base.back() == L'/') base.pop_back();
+	std::string resp;
+	DWORD status = 0;
+	std::wstring auth = L"Authorization: Bearer " + U2W(c.syncKey) + L"\r\n";
+	if (!HttpRequest(host, u.nPort, u.nScheme == INTERNET_SCHEME_HTTPS, verb, base + U2W(pathQuery), body, contentType, auth,
+	                 resp, status, err, 30000, cancellable))
+		return false;
+	out = JVal();
+	if (!ParseJson(resp, out) || out.t != JVal::Obj) {
+		if (!resp.empty() && resp.size() < 400 && status >= 500) err = resp;  // the Worker's own hint, e.g. missing KV binding
+		else err = "Unexpected answer from the cloud (HTTP " + std::to_string(status) + "). Is CloudUrl right and is the Worker deployed with the Telegram Notes code?";
+		return false;
+	}
+	if (!out["ok"].b) {
+		err = out["error"].s.empty() ? "Cloud error " + std::to_string(status) : out["error"].s;
+		return false;
+	}
+	return true;
+}
+
+static bool InNotesFolder(const Config &c, const std::wstring &path) {
+	size_t slash = path.find_last_of(L'\\');
+	return slash != std::wstring::npos && !lstrcmpiW(path.substr(0, slash).c_str(), c.notesFolder.c_str());
+}
+
+static const ListDef *ListForFile(const Config &c, const std::wstring &path) {
+	if (!InNotesFolder(c, path)) return nullptr;
+	for (auto &l : LISTS) if (!lstrcmpiW(FileNameOf(path).c_str(), l.file)) return &l;
+	return nullptr;
+}
+
+static bool IsTracked(const std::wstring &path) { return !IniGet(g_statePath, L"Tracked", Hash(W2U(LowerW(path))).c_str()).empty(); }
+
+static bool ShouldSync(const Config &c, const std::wstring &path) {
+	if (InNotesFolder(c, path)) return lstrcmpiW(FileNameOf(path).c_str(), INBOX_FILE) != 0;
+	return IsTracked(path);
+}
+
+// Uploads one note (or a todo/grocery list) if it changed since the last upload.
+static bool UploadFile(const Config &c, const std::wstring &path, bool force, std::string &err) {
+	WIN32_FILE_ATTRIBUTE_DATA fa;
+	if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) || (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) return true;
+	std::wstring key = Hash(W2U(LowerW(path)));
+	std::wstring stamp = std::to_wstring(((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime) + L"-" +
+	                     std::to_wstring(fa.nFileSizeLow);
+	if (!force && IniGet(g_statePath, L"Uploaded", key.c_str()) == stamp) return true;
+	std::string bytes;
+	if (fa.nFileSizeHigh || fa.nFileSizeLow > 5 * 1024 * 1024 || !ReadFileBytes(path, bytes)) return true;  // too big: skip
+	if (bytes.find('\0') != std::string::npos && !(bytes.size() >= 2 && (unsigned char)bytes[0] == 0xFF && (unsigned char)bytes[1] == 0xFE))
+		return true;  // not a text file
+	JVal r;
+	if (const ListDef *l = ListForFile(c, path)) {
+		if (!CloudCall(c, L"PUT", std::string("/api/lists?name=") + l->cmd, AnyToUtf8(bytes), r, err, true, L"text/plain; charset=utf-8")) return false;
+		WritePrivateProfileStringW(L"Lists", U2W(l->cmd).c_str(), Hash(r["text"].s).c_str(), g_statePath.c_str());
+	} else if (!CloudCall(c, L"PUT", "/api/notes?name=" + UrlEncode(W2U(FileNameOf(path))), AnyToUtf8(bytes), r, err, true,
+	                      L"text/plain; charset=utf-8")) {
+		return false;
+	}
+	WritePrivateProfileStringW(L"Uploaded", key.c_str(), stamp.c_str(), g_statePath.c_str());
+	return true;
+}
+
+static bool UploadAll(const Config &c, std::string &err) {
+	bool ok = true;
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileW((c.notesFolder + L"\\*").c_str(), &fd);
+	if (h != INVALID_HANDLE_VALUE) {
+		do {
+			if (fd.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN)) continue;
+			std::wstring p = c.notesFolder + L"\\" + fd.cFileName;
+			// Lists are only pushed when you save them; the cloud copy is the newest otherwise.
+			if (!ShouldSync(c, p) || ListForFile(c, p)) continue;
+			ok = UploadFile(c, p, false, err) && ok;
+		} while (FindNextFileW(h, &fd) && !g_stopping);
+		FindClose(h);
+	}
+	std::vector<wchar_t> sec(32768);
+	DWORD n = GetPrivateProfileSectionW(L"Tracked", sec.data(), (DWORD)sec.size(), g_statePath.c_str());
+	for (const wchar_t *e = sec.data(); e < sec.data() + n && *e; e += wcslen(e) + 1) {
+		const wchar_t *eq = wcschr(e, L'=');
+		if (eq && !InNotesFolder(c, eq + 1)) ok = UploadFile(c, eq + 1, false, err) && ok;
+	}
+	return ok;
+}
+
+// Keeps todo.txt / grocery.txt in the notes folder equal to the lists in the cloud.
+static bool PullLists(const Config &c, std::string &err) {
+	JVal r;
+	if (!CloudCall(c, L"GET", "/api/lists", "", r, err, true)) return false;
+	bool seeded = IniGet(g_statePath, L"Cloud", L"Seeded") == L"1";
+	for (auto &l : LISTS) {
+		const std::string &cloudText = r[l.cmd].s;
+		std::wstring path = c.notesFolder + L"\\" + l.file;
+		std::string local;
+		ReadFileBytes(path, local);
+		local = AnyToUtf8(local);
+		if (!seeded && Trim(cloudText).empty() && !Trim(local).empty()) {
+			// First connection: the lists you already had on the PC go to the cloud.
+			if (!UploadFile(c, path, true, err)) return false;
+			continue;
+		}
+		std::wstring h = Hash(cloudText);
+		if (h == IniGet(g_statePath, L"Lists", U2W(l.cmd).c_str())) continue;
+		if (local != cloudText) {
+			EnterCriticalSection(&g_fileLock);
+			WriteFileBytes(path, cloudText);
+			LeaveCriticalSection(&g_fileLock);
+		}
+		WritePrivateProfileStringW(L"Lists", U2W(l.cmd).c_str(), h.c_str(), g_statePath.c_str());
+		// Don't upload our own write back again.
+		WIN32_FILE_ATTRIBUTE_DATA fa;
+		if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa))
+			WritePrivateProfileStringW(L"Uploaded", Hash(W2U(LowerW(path))).c_str(),
+			                           (std::to_wstring(((ULONGLONG)fa.ftLastWriteTime.dwHighDateTime << 32) | fa.ftLastWriteTime.dwLowDateTime) + L"-" +
+			                            std::to_wstring(fa.nFileSizeLow)).c_str(),
+			                           g_statePath.c_str());
+	}
+	if (!seeded) WritePrivateProfileStringW(L"Cloud", L"Seeded", L"1", g_statePath.c_str());
+	return true;
+}
+
+// Moves notes typed on the phone from the cloud into the local inbox file. Returns how many.
+static int PullInbox(const Config &c, std::string &err, bool cancellable) {
+	EnterCriticalSection(&g_pullLock);
+	JVal r;
+	int count = -1;
+	if (CloudCall(c, L"GET", "/api/inbox", "", r, err, cancellable)) {
+		std::string entries;
+		long long upto = 0;
+		for (auto &it : r["items"].a) {
+			entries += "=== " + UnixToLocal(it["date"].i64()) + " ===\r\n";
+			for (auto &line : SplitLines(it["text"].s)) entries += line + "\r\n";
+			entries += "\r\n";
+			upto = std::max(upto, it["id"].i64());
+		}
+		count = (int)r["items"].a.size();
+		if (count) {
+			EnterCriticalSection(&g_fileLock);
+			bool ok = WriteFileBytes(InboxPath(c), entries, true);
+			LeaveCriticalSection(&g_fileLock);
+			JVal ack;
+			if (!ok) { err = "Could not write to the notes folder."; count = -1; }
+			else if (!CloudCall(c, L"POST", "/api/inbox/ack", "{\"upto\":" + std::to_string(upto) + "}", ack, err, cancellable))
+				count = -1;  // they'll come again next time; better twice than never
+		}
+	}
+	LeaveCriticalSection(&g_pullLock);
+	return count;
+}
+
+static void CloudPass(const Config &c) {
+	std::string err;
+	bool ok = true;
+	if (InterlockedExchange(&g_fullSync, 0)) ok = UploadAll(c, err);
+	std::vector<std::wstring> queue;
+	EnterCriticalSection(&g_queueLock);
+	queue.swap(g_uploadQueue);
+	LeaveCriticalSection(&g_queueLock);
+	for (auto &p : queue) ok = UploadFile(c, p, false, err) && ok;
+	if (!ok) InterlockedExchange(&g_fullSync, 1);  // try the failed ones again next time
+	ok = PullLists(c, err) && ok;
+	int n = PullInbox(c, err, true);
+	if (g_stopping || err == "cancelled") return;
+	if (n > 0) {
+		if (c.autoOpen) PostMessageW(g_msgWnd, WM_TN_AUTOFETCH, 0, 0);
+		else PostStatus(L"Telegram: " + std::to_wstring(InboxCount(c)) + L" note(s) from your phone. Plugins > Telegram Notes > Fetch notes from phone", false);
+	}
+	if (!ok || n < 0) PostStatus(L"Telegram: cloud sync failed: " + U2W(err), false);
+	else if (InterlockedExchange(&g_reportSync, 0)) PostStatus(L"Telegram: synced with the cloud ✔", false);
+}
+
 static DWORD WINAPI PollThread(LPVOID) {
+	HANDLE waits[2] = {g_stopEvent, g_wakeEvent};
 	while (!g_stopping) {
 		Config c = LoadConfig();
 		if (!c.ready() || g_pausePoll) {
 			WaitForSingleObject(g_stopEvent, 2000);
 			continue;
+		}
+		if (c.cloud) {
+			CloudPass(c);
+			WaitForMultipleObjects(2, waits, FALSE, 60000);
+			continue;
+		}
+		if (!IniGet(g_statePath, L"Cloud", L"ConnectedUrl").empty()) {
+			// CloudUrl was removed from the settings: take the bot back from the cloud.
+			JVal r;
+			std::string err;
+			if (Tg(c.token, "deleteWebhook", "{}", r, err, 20000))
+				WritePrivateProfileStringW(L"Cloud", L"ConnectedUrl", nullptr, g_statePath.c_str());
 		}
 		long long offset = LoadOffset();
 		JVal updates;
@@ -1077,6 +1339,7 @@ static DWORD WINAPI PollThread(LPVOID) {
 static void StartPolling() {
 	if (g_pollThread) return;
 	g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 	g_pollThread = CreateThread(nullptr, 0, PollThread, nullptr, 0, nullptr);
 }
 
@@ -1205,7 +1468,86 @@ static void FetchInbox(bool quietIfEmpty) {
 	PostStatus(L"Telegram: notes from your phone opened in a new tab.", false);
 }
 
-static void CmdFetch() { FetchInbox(false); }
+static void CmdFetch() {
+	Config c = LoadConfig();
+	if (c.cloud) {
+		std::string err;
+		HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+		int n = PullInbox(c, err, false);
+		SetCursor(old);
+		if (n < 0) ShowInfo(L"Could not download your phone notes from the cloud.\n\n" + U2W(err), MB_ICONWARNING);
+	}
+	FetchInbox(false);
+}
+
+static void Wake() {
+	if (g_wakeEvent) SetEvent(g_wakeEvent);
+}
+
+static void CmdCloudConnect() {
+	Config c;
+	if (!RequireSetup(c)) return;
+	if (c.cloudUrl.empty()) {
+		if (IniGet(g_iniPath, L"Cloud", L"CloudUrl", L"?") == L"?") {
+			WritePrivateProfileStringW(L"Cloud", L"CloudUrl", L"", g_iniPath.c_str());
+			WritePrivateProfileStringW(L"Cloud", L"SyncKey", L"", g_iniPath.c_str());
+		}
+		ShowInfo(L"First create your free cloud bot on Cloudflare (README, part 2: \"Keep the bot running when your PC is off\").\n\n"
+		         L"Then paste its address after  CloudUrl=  at the bottom of the settings file, save it (Ctrl+S) and click \"Connect to cloud\" again.\n\n"
+		         L"The settings file opens now.");
+		return CmdSettings();
+	}
+	if (c.syncKey.empty()) {
+		c.syncKey = RandomHex(24);
+		WritePrivateProfileStringW(L"Cloud", L"SyncKey", U2W(c.syncKey).c_str(), g_iniPath.c_str());
+	}
+	InterlockedExchange(&g_pausePoll, 1);
+	CancelPoll();
+	JVal r;
+	std::string err;
+	HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+	bool ok = CloudCall(c, L"POST", "/api/setup",
+	                    "{\"syncKey\":" + JsonStr(c.syncKey) + ",\"botToken\":" + JsonStr(c.token) + ",\"chatId\":" + JsonStr(c.chatId) + "}", r, err);
+	SetCursor(old);
+	if (ok) {
+		WritePrivateProfileStringW(L"Cloud", L"ConnectedUrl", c.cloudUrl.c_str(), g_statePath.c_str());
+		WritePrivateProfileStringW(L"Cloud", L"Seeded", L"0", g_statePath.c_str());
+		InterlockedExchange(&g_fullSync, 1);
+		InterlockedExchange(&g_reportSync, 1);
+	}
+	InterlockedExchange(&g_pausePoll, 0);
+	Wake();
+	if (!ok) return ShowInfo(L"Could not connect to the cloud bot at\n" + c.cloudUrl + L"\n\n" + U2W(err), MB_ICONWARNING);
+	ShowInfo(L"Done! @" + U2W(r["bot"].s) + L" now runs in the cloud and answers 24/7, even when your PC is off.\n\n"
+	         L"Notepad++ uploads the notes in your notes folder now, and again every time you save one. "
+	         L"Notes you type on your phone come into Notepad++ whenever it is open.\n\n"
+	         L"Try it on your phone: send /list");
+}
+
+static void CmdTrackFile() {
+	Config c = LoadConfig();
+	if (!c.cloud) return ShowInfo(L"This needs the cloud bot. Set it up first with Plugins > Telegram Notes > Connect to cloud.");
+	wchar_t buf[MAX_PATH * 2] = {};
+	SendMessageW(g_npp._nppHandle, NPPM_GETFULLCURRENTPATH, MAX_PATH * 2, (LPARAM)buf);
+	std::wstring path = buf;
+	if (!FileExists(path)) return ShowInfo(L"Save this file first (Ctrl+S), then try again.");
+	if (!ShouldSync(c, path)) WritePrivateProfileStringW(L"Tracked", Hash(W2U(LowerW(path))).c_str(), path.c_str(), g_statePath.c_str());
+	EnterCriticalSection(&g_queueLock);
+	g_uploadQueue.push_back(path);
+	LeaveCriticalSection(&g_queueLock);
+	InterlockedExchange(&g_reportSync, 1);
+	Wake();
+	ShowInfo(L"\"" + FileNameOf(path) + L"\" is now a cloud note. It uploads now and every time you save it.\n\nOn your phone: /get " + FileNameOf(path));
+}
+
+static void CmdSyncNow() {
+	Config c = LoadConfig();
+	if (!c.cloud) return ShowInfo(L"This needs the cloud bot. Set it up first with Plugins > Telegram Notes > Connect to cloud.");
+	InterlockedExchange(&g_fullSync, 1);
+	InterlockedExchange(&g_reportSync, 1);
+	PostStatus(L"Telegram: syncing with the cloud...", false);
+	Wake();
+}
 
 static void CmdOpenFolder() {
 	Config c = LoadConfig();
@@ -1215,6 +1557,8 @@ static void CmdOpenFolder() {
 static void CmdConnect() {
 	EnsureIni();
 	Config c = LoadConfig();
+	if (c.cloud && !c.chatId.empty())
+		return ShowInfo(L"Your phone is already connected (through the cloud bot). Nothing to do here.");
 	if (c.token.empty()) {
 		ShowInfo(L"Step 1 first: paste your bot token into the settings file and save it (Ctrl+S).\n\nThe settings file will open now. The steps are written at the top.");
 		return CmdSettings();
@@ -1294,9 +1638,11 @@ static void CmdHelp() {
 		L"- Send selection: only the selected text\n"
 		L"- Send as todo list: one task per line, sent as a checklist\n"
 		L"- Fetch notes from phone: opens what you typed to the bot in a new tab\n\n"
-		L"FROM YOUR PHONE (while Notepad++ is open)\n"
+		L"FROM YOUR PHONE\n"
 		L"/list, /get name, /todo, /done 2, /grocery, /got 1, /clear todo, /ping\n"
-		L"Anything else you type is kept for \"Fetch notes from phone\".\n\n"
+		L"Anything else you type is kept for \"Fetch notes from phone\".\n"
+		L"Without the cloud bot this only works while Notepad++ is open. With \"Connect to cloud\" "
+		L"(free Cloudflare Worker, see README) the bot answers 24/7 and Notepad++ uploads your notes when you save them.\n\n"
 		L"Only your own Telegram account (the connected chat) can use the bot.");
 }
 
@@ -1341,6 +1687,11 @@ static FuncItem g_funcs[] = {
 	{L"", nullptr, 0, false, nullptr},
 	{L"Settings (bot token)", CmdSettings, 0, false, nullptr},
 	{L"Connect my phone", CmdConnect, 0, false, nullptr},
+	{L"", nullptr, 0, false, nullptr},
+	{L"Connect to cloud (works when PC is off)", CmdCloudConnect, 0, false, nullptr},
+	{L"Add this file to cloud notes", CmdTrackFile, 0, false, nullptr},
+	{L"Sync with cloud now", CmdSyncNow, 0, false, nullptr},
+	{L"", nullptr, 0, false, nullptr},
 	{L"Help", CmdHelp, 0, false, nullptr},
 };
 
@@ -1349,6 +1700,8 @@ BOOL APIENTRY DllMain(HINSTANCE h, DWORD reason, LPVOID) {
 		g_hInst = h;
 		InitializeCriticalSection(&g_lock);
 		InitializeCriticalSection(&g_fileLock);
+		InitializeCriticalSection(&g_queueLock);
+		InitializeCriticalSection(&g_pullLock);
 	}
 	return TRUE;
 }
@@ -1383,6 +1736,19 @@ extern "C" __declspec(dllexport) void beNotified(SCNotification *n) {
 			                PLUGIN_NAME, MB_YESNO | MB_ICONINFORMATION) == IDYES)
 				CmdSettings();
 		}
+	} else if (n->nmhdr.code == NPPN_FILESAVED) {
+		Config c = LoadConfig();
+		if (!c.cloud) return;
+		int len = (int)SendMessageW(g_npp._nppHandle, NPPM_GETFULLPATHFROMBUFFERID, n->nmhdr.idFrom, 0);
+		if (len <= 0) return;
+		std::wstring path(len + 1, L'\0');
+		SendMessageW(g_npp._nppHandle, NPPM_GETFULLPATHFROMBUFFERID, n->nmhdr.idFrom, (LPARAM)&path[0]);
+		path.resize(wcslen(path.c_str()));
+		if (!ShouldSync(c, path)) return;
+		EnterCriticalSection(&g_queueLock);
+		g_uploadQueue.push_back(path);
+		LeaveCriticalSection(&g_queueLock);
+		Wake();
 	} else if (n->nmhdr.code == NPPN_SHUTDOWN) {
 		StopPolling();
 		if (g_msgWnd) DestroyWindow(g_msgWnd);

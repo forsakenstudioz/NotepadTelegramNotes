@@ -65,6 +65,7 @@ struct SCNotification {
 
 #define NPPN_FIRST 1000
 #define NPPN_READY (NPPN_FIRST + 1)
+#define NPPN_FILESAVED (NPPN_FIRST + 8)
 #define NPPN_SHUTDOWN (NPPN_FIRST + 9)
 
 #define L_TEXT 0
